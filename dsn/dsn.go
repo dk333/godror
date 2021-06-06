@@ -13,7 +13,6 @@ import (
 	"hash/fnv"
 	"io"
 	"net/url"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -719,7 +718,6 @@ func splitQuoted(s string, sep rune) []string {
 		off += sepLen
 	}
 }
-
 func splitDSN(s string) []string {
 	var result []string
 	re := regexp.MustCompile("(^\"?.+?\"?)/(\"?.+\"?)@(.*)/(.*)")
@@ -776,20 +774,17 @@ func parseUserPassw(dataSourceName string) (user, passw, connectString string) {
 		return user, passw, unquote(extra)
 	}
 	// return user, passw, unquote(ups[1] + extra)
-	res := splitDSN(dataSourceName)
 
+	res := splitDSN(dataSourceName)
 	user = res[0]
 	passw = res[1]
 	host := res[2]
 	dbname := res[3]
-	// fmt.Println(host, dbname)
-	// fmt.Println(unquote(ups[1]))
 
 	// fmt.Println(user, passw, host+"/"+dbname)
 	return user, passw, host + "/" + dbname
 	// return user, passw, unquote(ups[1])
 }
-
 // ParseTZ parses timezone specification ("Europe/Budapest" or "+01:00") and returns the offset in seconds.
 func ParseTZ(s string) (int, error) {
 	s = strings.TrimSpace(s)
