@@ -6,12 +6,14 @@
 package dsn
 
 import (
+	"context"
 	"database/sql/driver"
 	"encoding/base64"
 	"fmt"
 	"hash/fnv"
 	"io"
 	"net/url"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -51,13 +53,15 @@ type CommonParams struct {
 	Password                Password
 	ConfigDir, LibDir       string
 	// OnInit is executed on session init. Overrides AlterSession and OnInitStmts!
-	OnInit func(driver.Conn) error
+	OnInit func(context.Context, driver.ConnPrepareContext) error
 	// OnInitStmts are executed on session init, iff OnInit is nil.
 	OnInitStmts []string
 	// AlterSession key-values are set with "ALTER SESSION SET key=value" on session init, iff OnInit is nil.
 	AlterSession [][2]string
 	Timezone     *time.Location
-	EnableEvents bool
+	// StmtCacheSize of 0 means the default, -1 to disable the stmt cache completely
+	StmtCacheSize           int
+	EnableEvents, NoTZCheck bool
 }
 
 // String returns the string representation of CommonParams.
@@ -72,14 +76,24 @@ func (P CommonParams) String() string {
 	if P.LibDir != "" {
 		q.Add("libDir", P.LibDir)
 	}
-	s := "local"
+	var s string
 	tz := P.Timezone
-	if tz != nil && tz != time.Local {
-		s = tz.String()
+	if tz != nil {
+		if tz == time.Local {
+			s = "local"
+		} else {
+			s = tz.String()
+		}
 	}
 	q.Add("timezone", s)
 	if P.EnableEvents {
 		q.Add("enableEvents", "1")
+	}
+	if P.NoTZCheck {
+		q.Add("noTimezoneCheck", "1")
+	}
+	if P.StmtCacheSize != 0 {
+		q.Add("stmtCacheSize", strconv.Itoa(int(P.StmtCacheSize)))
 	}
 
 	return q.String()
@@ -123,7 +137,9 @@ func (P ConnParams) String() string {
 // PoolParams holds the configuration of the Oracle Session Pool.
 type PoolParams struct {
 	MinSessions, MaxSessions, SessionIncrement int
+	MaxSessionsPerShard                        int
 	WaitTimeout, MaxLifeTime, SessionTimeout   time.Duration
+	PingInterval                               time.Duration
 	Heterogeneous, ExternalAuth                bool
 }
 
@@ -132,6 +148,9 @@ func (P PoolParams) String() string {
 	q := newParamsArray(8)
 	q.Add("poolMinSessions", strconv.Itoa(P.MinSessions))
 	q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	if P.MaxSessionsPerShard != 0 {
+		q.Add("poolMasSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
+	}
 	q.Add("poolIncrement", strconv.Itoa(P.SessionIncrement))
 	if P.Heterogeneous {
 		q.Add("heterogeneousPool", "1")
@@ -141,6 +160,9 @@ func (P PoolParams) String() string {
 	q.Add("poolSessionTimeout", P.SessionTimeout.String())
 	if P.ExternalAuth {
 		q.Add("externalAuth", "1")
+	}
+	if P.PingInterval != 0 {
+		q.Add("pingInterval", P.PingInterval.String())
 	}
 	return q.String()
 }
@@ -152,8 +174,7 @@ type ConnectionParams struct {
 	CommonParams
 	ConnParams
 	PoolParams
-	// NewPassword is used iff StandaloneConnection is true!
-	NewPassword          Password
+	// ConnParams.NewPassword is used iff StandaloneConnection is true!
 	StandaloneConnection bool
 }
 
@@ -221,10 +242,13 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 			q.Add("newPassword", P.NewPassword.String())
 		}
 	}
-	s = "local"
-	tz := P.Timezone
-	if tz != nil && tz != time.Local {
-		s = tz.String()
+	s = ""
+	if tz := P.Timezone; tz != nil {
+		if tz == time.Local {
+			s = "local"
+		} else {
+			s = tz.String()
+		}
 	}
 	q.Add("timezone", s)
 	B := func(b bool) string {
@@ -233,8 +257,15 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 		}
 		return "0"
 	}
+	q.Add("noTimezoneCheck", B(P.NoTZCheck))
+	if P.StmtCacheSize != 0 {
+		q.Add("stmtCacheSize", strconv.Itoa(int(P.StmtCacheSize)))
+	}
 	q.Add("poolMinSessions", strconv.Itoa(P.MinSessions))
 	q.Add("poolMaxSessions", strconv.Itoa(P.MaxSessions))
+	if P.MaxSessionsPerShard != 0 {
+		q.Add("poolMasSessionsPerShard", strconv.Itoa(P.MaxSessionsPerShard))
+	}
 	q.Add("poolIncrement", strconv.Itoa(P.SessionIncrement))
 	q.Add("sysdba", B(P.IsSysDBA))
 	q.Add("sysoper", B(P.IsSysOper))
@@ -242,6 +273,7 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 	q.Add("standaloneConnection", B(P.StandaloneConnection))
 	q.Add("enableEvents", B(P.EnableEvents))
 	q.Add("heterogeneousPool", B(P.Heterogeneous))
+	q.Add("externalAuth", B(P.ExternalAuth))
 	q.Add("prelim", B(P.IsPrelim))
 	q.Add("poolWaitTimeout", P.WaitTimeout.String())
 	q.Add("poolSessionMaxLifetime", P.MaxLifeTime.String())
@@ -261,6 +293,8 @@ func (P ConnectionParams) string(class, withPassword bool) string {
 }
 
 // Parse parses the given connection string into a struct.
+//
+// For examples, see [../doc/connection.md](../doc/connection.md)
 func Parse(dataSourceName string) (ConnectionParams, error) {
 	P := ConnectionParams{
 		StandaloneConnection: DefaultStandaloneConnection,
@@ -376,7 +410,10 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 
 		{&P.EnableEvents, "enableEvents"},
 		{&P.Heterogeneous, "heterogeneousPool"},
+		{&P.ExternalAuth, "externalAuth"},
 		{&P.StandaloneConnection, "standaloneConnection"},
+
+		{&P.NoTZCheck, "noTimezoneCheck"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -408,16 +445,20 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		} else {
 			return P, errors.Errorf("%s: %w", tz, err)
 		}
+		if P.Timezone == nil {
+			P.Timezone = time.UTC
+		}
 	}
-
 	for _, task := range []struct {
 		Dest *int
 		Key  string
 	}{
 		{&P.MinSessions, "poolMinSessions"},
 		{&P.MaxSessions, "poolMaxSessions"},
+		{&P.MaxSessionsPerShard, "poolMasSessionsPerShard"},
 		{&P.SessionIncrement, "poolIncrement"},
 		{&P.SessionIncrement, "sessionIncrement"},
+		{&P.StmtCacheSize, "stmtCacheSize"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -429,6 +470,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 			return P, errors.Errorf("%s: %w", task.Key+"="+s, err)
 		}
 	}
+
 	for _, task := range []struct {
 		Dest *time.Duration
 		Key  string
@@ -436,6 +478,7 @@ func Parse(dataSourceName string) (ConnectionParams, error) {
 		{&P.SessionTimeout, "poolSessionTimeout"},
 		{&P.WaitTimeout, "poolWaitTimeout"},
 		{&P.MaxLifeTime, "poolSessionMaxLifetime"},
+		{&P.PingInterval, "pingInterval"},
 	} {
 		s := q.Get(task.Key)
 		if s == "" {
@@ -677,6 +720,31 @@ func splitQuoted(s string, sep rune) []string {
 	}
 }
 
+func splitDSN(s string) []string {
+	var result []string
+	re := regexp.MustCompile("(^\"?.+?\"?)/(\"?.+\"?)@(.*)/(.*)")
+	groupNames := re.SubexpNames()
+	for matchNum, match := range re.FindAllStringSubmatch(s, -1) {
+		idx := 0
+		for groupIdx, group := range match {
+			if idx == 0 {
+				idx++
+				continue
+			}
+			result = append(result, strings.ReplaceAll(group, "\"", ""))
+			name := groupNames[groupIdx]
+			if name == "" {
+				name = "*"
+			}
+			if 1 == 2 {
+				fmt.Printf("#%d text: '%s', group: '%s'\n", matchNum, group, name)
+			}
+		}
+	}
+	// fmt.Println(result)
+	return result
+}
+
 // parseUserPassw splits of the username/password@ from the connectString.
 func parseUserPassw(dataSourceName string) (user, passw, connectString string) {
 	if i := strings.Index(dataSourceName, "://"); i >= 0 &&
@@ -707,7 +775,19 @@ func parseUserPassw(dataSourceName string) (user, passw, connectString string) {
 	if len(ups) == 1 {
 		return user, passw, unquote(extra)
 	}
-	return user, passw, unquote(ups[1] + extra)
+	// return user, passw, unquote(ups[1] + extra)
+	res := splitDSN(dataSourceName)
+
+	user = res[0]
+	passw = res[1]
+	host := res[2]
+	dbname := res[3]
+	// fmt.Println(host, dbname)
+	// fmt.Println(unquote(ups[1]))
+
+	// fmt.Println(user, passw, host+"/"+dbname)
+	return user, passw, host + "/" + dbname
+	// return user, passw, unquote(ups[1])
 }
 
 // ParseTZ parses timezone specification ("Europe/Budapest" or "+01:00") and returns the offset in seconds.
@@ -722,11 +802,11 @@ func ParseTZ(s string) (int, error) {
 	var tz int
 	var ok bool
 	if i := strings.IndexByte(s, ':'); i >= 0 {
-		i64, err := strconv.ParseInt(s[i+1:], 10, 6)
+		u64, err := strconv.ParseUint(s[i+1:], 10, 6)
 		if err != nil {
 			return tz, errors.Errorf("%s: %w", s, err)
 		}
-		tz = int(i64 * 60)
+		tz = int(u64 * 60)
 		s = s[:i]
 		ok = true
 	}
@@ -735,6 +815,9 @@ func ParseTZ(s string) (int, error) {
 			targetLoc, err := time.LoadLocation(s)
 			if err != nil {
 				return tz, errors.Errorf("%s: %w", s, err)
+			}
+			if targetLoc == nil {
+				targetLoc = time.UTC
 			}
 
 			_, localOffset := time.Now().In(targetLoc).Zone()
